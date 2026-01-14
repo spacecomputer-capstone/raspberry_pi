@@ -29,6 +29,14 @@ npm i @abandonware/bleno @abandonware/bluetooth-hci-socket dotenv tweetnacl
 
 ## 4) Add the .env and create the ed25519 pair
 
+### Option 1: Use ctrng
+
+```bash
+node ctrng_seed.js
+```
+
+### Option 2: Use openssl
+
 ```bash
 SEED=$(openssl rand -hex 32); echo "$SEED"
 node -e "const n=require('tweetnacl');const s=Buffer.from(process.argv[1],'hex');const k=n.sign.keyPair.fromSeed(s);console.log(Buffer.from(k.publicKey).toString('hex'))" "$SEED"
