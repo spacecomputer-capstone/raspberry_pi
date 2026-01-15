@@ -1,10 +1,20 @@
 /**
- * beacon.js — Proof-of-Presence BLE Beacon (Ed25519 tokens + relay-defense loop)
-
- * Relay loop rule:
- *  - Pi derives k = sha256(tokenB) (32 bytes)
- *  - Each round: c_i = random 16 bytes
- *  - Phone response: r_i = sha256(k || c_i) (32 bytes)
+ * beacon.js — Proof-of-Presence BLE Beacon (BASIC flow + relay-counter challenges) — FULL VERSION
+ *
+ * So we send result: true (boolean) in attPi.
+ *
+ * Flow:
+ * 1) Browser/phone gets attempt_token from backend
+ * 2) Browser/phone sends token over BLE: "LEN:<n>\n" + token bytes (chunked)
+ * 3) Pi verifies token, POST /presence/session, verifies tokenB
+ * 4) Pi runs 1–3 CSPRNG challenge/response RTT rounds with phone over BLE
+ * 5) Pi signs attPi including timing_summary + transcript_hash, POST /presence/attest
+ * 6) Pi notifies RESULT JSON over BLE: {ok:true, proof_id, result:true}
+ *
+ * IMPORTANT:
+ * - ATTEMPT_TOKEN characteristic supports both "write" and "writeWithoutResponse"
+ * - Token RX is robust even if header is fragmented or coalesced with first token chunk
+ * - Challenge layer does NOT enforce any timing threshold yet (result stays true)
  */
 
 require("dotenv").config();
@@ -13,35 +23,69 @@ const nacl = require("tweetnacl");
 const axios = require("axios");
 const crypto = require("crypto");
 
-// ========= ENV =========
-const SERVICE_UUID    = (process.env.VITE_SERVICE_UUID || "").toLowerCase();
-const ID_CHAR_UUID    = (process.env.VITE_ID_CHAR_UUID || "").toLowerCase();
-const NONCE_CHAR_UUID = (process.env.VITE_SIGN_NONCE_UUID || "").toLowerCase();
-const RESP_CHAR_UUID  = (process.env.VITE_SIGN_RESP_UUID || "").toLowerCase();
+// ========= UUIDs (defaults match your Flutter PoP client) =========
+const DEFAULT_SERVICE_UUID = "eb5c86a4-733c-4d9d-aab2-285c2dab09a1";
+const DEFAULT_ID_CHAR_UUID = "eb5c86a4-733c-4d9d-aab2-285c2dab09a2";
+const DEFAULT_ATTEMPT_TOKEN_UUID = "8c0b8f3e-1b7a-4e58-9b9e-6fbb4e3d2b01";
+const DEFAULT_RESULT_UUID = "8c0b8f3e-1b7a-4e58-9b9e-6fbb4e3d2b02";
 
-const ATTEMPT_TOKEN_UUID = (process.env.VITE_ATTEMPT_TOKEN_UUID || "").toLowerCase();
-const CHALLENGE_UUID     = (process.env.VITE_CHALLENGE_UUID || "").toLowerCase();
-const RESPONSE_UUID      = (process.env.VITE_RESPONSE_UUID || "").toLowerCase();
-const RESULT_UUID        = (process.env.VITE_RESULT_UUID || "").toLowerCase();
+// NEW: relay-counter challenge UUIDs
+const DEFAULT_CHALLENGE_UUID = "8c0b8f3e-1b7a-4e58-9b9e-6fbb4e3d2b03";
+const DEFAULT_CHALLENGE_RESP_UUID = "8c0b8f3e-1b7a-4e58-9b9e-6fbb4e3d2b04";
+
+// Optional legacy nonce signer UUIDs (only enabled if you set env vars)
+const LEGACY_NONCE_UUID = (process.env.VITE_SIGN_NONCE_UUID || "").toLowerCase();
+const LEGACY_RESP_UUID = (process.env.VITE_SIGN_RESP_UUID || "").toLowerCase();
+
+// Use env override if set; otherwise defaults
+const SERVICE_UUID = (process.env.VITE_SERVICE_UUID || DEFAULT_SERVICE_UUID).toLowerCase();
+const ID_CHAR_UUID = (process.env.VITE_ID_CHAR_UUID || DEFAULT_ID_CHAR_UUID).toLowerCase();
+const ATTEMPT_TOKEN_UUID = (process.env.VITE_ATTEMPT_TOKEN_UUID || DEFAULT_ATTEMPT_TOKEN_UUID).toLowerCase();
+const RESULT_UUID = (process.env.VITE_RESULT_UUID || DEFAULT_RESULT_UUID).toLowerCase();
+
+// NEW: challenge UUID overrides
+const CHALLENGE_UUID = (process.env.VITE_CHALLENGE_UUID || DEFAULT_CHALLENGE_UUID).toLowerCase();
+const CHALLENGE_RESP_UUID = (process.env.VITE_CHALLENGE_RESP_UUID || DEFAULT_CHALLENGE_RESP_UUID).toLowerCase();
 
 const BACKEND_BASE_URL = process.env.BACKEND_BASE_URL || "http://172.20.10.7:5001";
 const BACKEND_VERIFY_KEY_HEX = (process.env.BACKEND_VERIFY_KEY_HEX || "").toLowerCase();
 const PI_ID = process.env.PI_ID || "";
 
-const RELAY_M = Math.min(255, Math.max(1, parseInt(process.env.RELAY_M || "16", 10)));
-const RELAY_TIMEOUT_MS = Math.max(10, parseInt(process.env.RELAY_TIMEOUT_MS || "250", 10));
-
+// Beacon ID (8 bytes hex)
 const BEACON_ID_HEX = (process.env.BEACON_ID_HEX || "").toLowerCase();
-if (!/^[0-9a-f]{16}$/.test(BEACON_ID_HEX)) throw new Error("BEACON_ID_HEX must be 16 hex chars (8 bytes)");
+if (!/^[0-9a-f]{16}$/.test(BEACON_ID_HEX)) {
+  throw new Error("BEACON_ID_HEX must be 16 hex chars (8 bytes)");
+}
 const BEACON_ID = Buffer.from(BEACON_ID_HEX, "hex");
 
-// Pi keypair (must match Pi.pubkey_hex stored in DB)
+// Pi ed25519 seed (32 bytes hex)
 const SEED_HEX = (process.env.ED25519_SEED_HEX || "").toLowerCase();
 if (!/^[0-9a-f]{64}$/.test(SEED_HEX)) throw new Error("ED25519_SEED_HEX must be 32-byte hex");
 const seed = Buffer.from(SEED_HEX, "hex");
 const kp = nacl.sign.keyPair.fromSeed(new Uint8Array(seed));
 
-// ========= COMPACT ED25519 (match backend/crypto_utils.py) =========
+// Helpful process instance label (makes it obvious if two beacons are running)
+const INSTANCE = `${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+function log(...a) {
+  console.log(`[beacon ${INSTANCE}]`, ...a);
+}
+function err(...a) {
+  console.error(`[beacon ${INSTANCE}]`, ...a);
+}
+
+log("=== PoP Beacon starting ===");
+log("SERVICE_UUID        =", SERVICE_UUID);
+log("ID_CHAR_UUID        =", ID_CHAR_UUID);
+log("ATTEMPT_TOKEN_UUID  =", ATTEMPT_TOKEN_UUID);
+log("RESULT_UUID         =", RESULT_UUID);
+log("CHALLENGE_UUID      =", CHALLENGE_UUID);
+log("CHALLENGE_RESP_UUID =", CHALLENGE_RESP_UUID);
+log("BACKEND_BASE_URL    =", BACKEND_BASE_URL);
+log("PI_ID               =", PI_ID);
+log("BACKEND_VERIFY_KEY? =", BACKEND_VERIFY_KEY_HEX ? "set" : "MISSING");
+log("===========================");
+
+// ========= Compact Ed25519 helpers (must match backend/crypto_utils.py) =========
 function b64urlEncode(buf) {
   return Buffer.from(buf)
     .toString("base64")
@@ -64,17 +108,10 @@ function deepSort(obj) {
   return out;
 }
 function canonicalJsonBytes(obj) {
-  // Python: json.dumps(..., separators=(",", ":"), sort_keys=True)
-  // JS: JSON.stringify already uses "," and ":" without spaces; we ensure key ordering.
   return Buffer.from(JSON.stringify(deepSort(obj)), "utf8");
 }
 function sha256HexUtf8(s) {
   return crypto.createHash("sha256").update(s, "utf8").digest("hex");
-}
-function sha256Buf(...parts) {
-  const h = crypto.createHash("sha256");
-  for (const p of parts) h.update(p);
-  return h.digest(); // Buffer
 }
 function signCompactEd25519(payloadObj) {
   const msg = canonicalJsonBytes(payloadObj);
@@ -87,12 +124,46 @@ function verifyCompactEd25519(compact, verifyKeyHex) {
   const msg = b64urlDecode(parts[0]);
   const sig = b64urlDecode(parts[1]);
   const vk = Buffer.from(verifyKeyHex, "hex");
-  const ok = nacl.sign.detached.verify(new Uint8Array(msg), new Uint8Array(sig), new Uint8Array(vk));
+  const ok = nacl.sign.detached.verify(
+    new Uint8Array(msg),
+    new Uint8Array(sig),
+    new Uint8Array(vk)
+  );
   if (!ok) throw new Error("bad signature");
   return JSON.parse(msg.toString("utf8"));
 }
 
-// ========= OLD NONCE SIGNER (kept) =========
+// ========= RESULT notify =========
+let resultNotifyCb = null;
+
+class ResultCharacteristic extends bleno.Characteristic {
+  constructor() {
+    super({ uuid: RESULT_UUID, properties: ["notify"], value: null });
+  }
+  onSubscribe(_maxValueSize, cb) {
+    resultNotifyCb = cb;
+    log("RESULT subscribed ✅");
+  }
+  onUnsubscribe() {
+    resultNotifyCb = null;
+    log("RESULT unsubscribed");
+  }
+}
+
+function notifyResult(obj) {
+  if (!resultNotifyCb) {
+    log("notifyResult: No subscriber on RESULT characteristic");
+    return;
+  }
+  log("notifyResult ->", obj);
+  try {
+    resultNotifyCb(Buffer.from(JSON.stringify(obj), "utf8"));
+  } catch (e) {
+    err("result notify failed:", e.message);
+  }
+}
+
+// ========= ID characteristic =========
 class IdCharacteristic extends bleno.Characteristic {
   constructor() {
     super({ uuid: ID_CHAR_UUID, properties: ["read"], value: null });
@@ -103,29 +174,31 @@ class IdCharacteristic extends bleno.Characteristic {
   }
 }
 
+// ========= Optional legacy nonce signer (only if env UUIDs exist) =========
+let legacyNotifyCb = null;
 let lastNonce = null;
+
 class NonceCharacteristic extends bleno.Characteristic {
   constructor() {
-    super({ uuid: NONCE_CHAR_UUID, properties: ["writeWithoutResponse"], value: null });
+    super({ uuid: LEGACY_NONCE_UUID, properties: ["write", "writeWithoutResponse"], value: null });
   }
   onWriteRequest(data, offset, _withoutResponse, cb) {
     if (offset) return cb(this.RESULT_ATTR_NOT_LONG);
     lastNonce = Buffer.from(data);
-    trySignAndNotify();
+    trySignAndNotifyLegacy();
     cb(this.RESULT_SUCCESS);
   }
 }
 
-let notifyCb = null;
 class ResponseCharacteristic extends bleno.Characteristic {
   constructor() {
-    super({ uuid: RESP_CHAR_UUID, properties: ["notify"], value: null });
+    super({ uuid: LEGACY_RESP_UUID, properties: ["notify"], value: null });
   }
   onSubscribe(_m, updateValueCallback) {
-    notifyCb = updateValueCallback;
+    legacyNotifyCb = updateValueCallback;
   }
   onUnsubscribe() {
-    notifyCb = null;
+    legacyNotifyCb = null;
   }
 }
 
@@ -138,200 +211,310 @@ function be64(tsMs) {
   }
   return b;
 }
-function buildPayload(nonceBuf) {
+function buildLegacyPayload(nonceBuf) {
   const tsBuf = be64(Date.now());
-  const msg = Buffer.concat([nonceBuf, tsBuf]); // 24 bytes
-  const sig = Buffer.from(nacl.sign.detached(new Uint8Array(msg), kp.secretKey)); // 64
-  return Buffer.concat([tsBuf, sig]); // 72
+  const msg = Buffer.concat([nonceBuf, tsBuf]);
+  const sig = Buffer.from(nacl.sign.detached(new Uint8Array(msg), kp.secretKey));
+  return Buffer.concat([tsBuf, sig]);
 }
-function trySignAndNotify() {
-  if (!notifyCb || !lastNonce) return;
+function trySignAndNotifyLegacy() {
+  if (!legacyNotifyCb || !lastNonce) return;
   try {
-    notifyCb(buildPayload(lastNonce));
+    legacyNotifyCb(buildLegacyPayload(lastNonce));
   } catch (e) {
-    console.error("nonce notify failed:", e.message);
+    err("legacy nonce notify failed:", e.message);
   } finally {
     lastNonce = null;
   }
 }
 
-// ========= NEW PoP BLE CHARACTERISTICS =========
-//
-// CHALLENGE notify (binary):
-//   INIT:  [0x00 || k(32) || m(1) || timeout_ms_u16le(2)]
-//   ROUND: [0x01 || i(1) || c_i(16)]
-//
-// RESPONSE write (binary):
-//   [i(1) || r_i(32)]  where r_i = sha256(k || c_i)
-//
-// RESULT notify (utf8 JSON):
-//   {"ok":true,"proof_id":"...","result":"ok"}  OR {"ok":false,"step":"...","error":"..."}
-
+// ========= NEW: CHALLENGE notify + response RX =========
 let challengeNotifyCb = null;
+
+// pending challenges keyed by `${sid}:${i}`
+// value: { nonceHex, sentMs, resolve, reject, timeoutId }
+const pendingChallenges = new Map();
+
 class ChallengeCharacteristic extends bleno.Characteristic {
   constructor() {
     super({ uuid: CHALLENGE_UUID, properties: ["notify"], value: null });
   }
-  onSubscribe(_m, cb) {
+  onSubscribe(_maxValueSize, cb) {
     challengeNotifyCb = cb;
+    log("CHALLENGE subscribed ✅");
   }
   onUnsubscribe() {
     challengeNotifyCb = null;
-  }
-}
-function notifyChallenge(buf) {
-  if (!challengeNotifyCb) return;
-  try {
-    challengeNotifyCb(buf);
-  } catch (e) {
-    console.error("challenge notify failed:", e.message);
+    log("CHALLENGE unsubscribed");
   }
 }
 
-let resultNotifyCb = null;
-class ResultCharacteristic extends bleno.Characteristic {
-  constructor() {
-    super({ uuid: RESULT_UUID, properties: ["notify"], value: null });
+function notifyChallenge(obj) {
+  if (!challengeNotifyCb) {
+    log("notifyChallenge: No subscriber on CHALLENGE characteristic");
+    return false;
   }
-  onSubscribe(_m, cb) {
-    resultNotifyCb = cb;
-  }
-  onUnsubscribe() {
-    resultNotifyCb = null;
-  }
-}
-function notifyResult(obj) {
-  if (!resultNotifyCb) return;
   try {
-    resultNotifyCb(Buffer.from(JSON.stringify(obj), "utf8"));
+    challengeNotifyCb(Buffer.from(JSON.stringify(obj), "utf8"));
+    return true;
   } catch (e) {
-    console.error("result notify failed:", e.message);
+    err("challenge notify failed:", e.message);
+    return false;
   }
 }
 
-// Response handling
-const pending = new Map(); // i -> { resolve, reject }
-class ResponseWriteCharacteristic extends bleno.Characteristic {
+class ChallengeRespCharacteristic extends bleno.Characteristic {
   constructor() {
-    super({ uuid: RESPONSE_UUID, properties: ["writeWithoutResponse", "write"], value: null });
+    super({
+      uuid: CHALLENGE_RESP_UUID,
+      properties: ["write", "writeWithoutResponse"],
+      value: null,
+    });
   }
+
   onWriteRequest(data, offset, _withoutResponse, cb) {
     if (offset) return cb(this.RESULT_ATTR_NOT_LONG);
+
     try {
-      const buf = Buffer.from(data);
-      if (buf.length !== 33) {
-        return cb(this.RESULT_UNLIKELY_ERROR);
+      const s = Buffer.from(data).toString("utf8");
+      let msg;
+      try {
+        msg = JSON.parse(s);
+      } catch {
+        log("CHALLENGE_RESP non-JSON:", s.slice(0, 140));
+        return cb(this.RESULT_SUCCESS);
       }
-      const i = buf.readUInt8(0);
-      const r = buf.subarray(1, 33);
-      const waiter = pending.get(i);
-      if (waiter) {
-        pending.delete(i);
-        waiter.resolve({ i, r });
+
+      // expected minimal: { sid, i, nonce }
+      const sid = msg.sid;
+      const i = msg.i;
+      const nonce = msg.nonce;
+
+      if (!sid || typeof i !== "number" || !nonce) {
+        log("CHALLENGE_RESP missing fields:", msg);
+        return cb(this.RESULT_SUCCESS);
       }
+
+      const key = `${sid}:${i}`;
+      const pending = pendingChallenges.get(key);
+      if (!pending) {
+        log("CHALLENGE_RESP no pending for", key);
+        return cb(this.RESULT_SUCCESS);
+      }
+
+      // nonce must match (counter replay / mismatch)
+      const nonceHex = String(nonce).toLowerCase();
+      if (nonceHex !== pending.nonceHex) {
+        log("CHALLENGE_RESP nonce mismatch:", { key, got: nonceHex, expected: pending.nonceHex });
+        return cb(this.RESULT_SUCCESS);
+      }
+
+      clearTimeout(pending.timeoutId);
+      pendingChallenges.delete(key);
+      pending.resolve({ recvMs: Date.now(), resp: msg });
+
       cb(this.RESULT_SUCCESS);
-    } catch {
-      cb(this.RESULT_UNLIKELY_ERROR);
+    } catch (e) {
+      err("CHALLENGE_RESP handler error:", e);
+      cb(this.RESULT_SUCCESS);
     }
   }
 }
 
-// Attempt token RX (chunked): write "LEN:<n>\n" then token bytes
+// ========= Relay-challenge helpers =========
+function percentile(arr, p) {
+  if (!arr.length) return null;
+  const xs = [...arr].sort((a, b) => a - b);
+  const idx = Math.ceil((p / 100) * xs.length) - 1;
+  return xs[Math.min(Math.max(idx, 0), xs.length - 1)];
+}
+
+async function performRelayChallenges({ sid, maxChallenges = 3, timeoutPerChallengeMs = 1200 }) {
+  const startedAtMs = Date.now();
+  const m = crypto.randomInt(1, maxChallenges + 1); // 1..3
+  const transcript = [];
+  const rtts = [];
+  let successCount = 0;
+
+  const hadSubscriber = !!challengeNotifyCb;
+
+  for (let i = 0; i < m; i++) {
+    const nonceHex = crypto.randomBytes(16).toString("hex"); // CSPRNG nonce
+    const sentMs = Date.now();
+
+    const chalMsg = {
+      type: "chal",
+      sid,
+      i,
+      nonce: nonceHex,
+      ts_pi_send: sentMs,
+    };
+
+    const delivered = hadSubscriber ? notifyChallenge(chalMsg) : false;
+
+    // Wait for response (even if not delivered, we'll just time out and log it)
+    const key = `${sid}:${i}`;
+    const outcome = await new Promise((resolve) => {
+      const timeoutId = setTimeout(() => {
+        pendingChallenges.delete(key);
+        resolve({ ok: false, reason: "timeout", recvMs: null, resp: null });
+      }, timeoutPerChallengeMs);
+
+      pendingChallenges.set(key, {
+        nonceHex,
+        sentMs,
+        timeoutId,
+        resolve: ({ recvMs, resp }) => resolve({ ok: true, reason: "ok", recvMs, resp }),
+        reject: () => resolve({ ok: false, reason: "reject", recvMs: null, resp: null }),
+      });
+    });
+
+    const recvMs = outcome.recvMs;
+    const rttMs = recvMs ? recvMs - sentMs : null;
+
+    if (outcome.ok && typeof rttMs === "number") {
+      rtts.push(rttMs);
+      successCount += 1;
+    }
+
+    transcript.push({
+      i,
+      nonce: nonceHex,
+      delivered,
+      sent_ms: sentMs,
+      recv_ms: recvMs,
+      rtt_ms: rttMs,
+      resp: outcome.resp,
+      status: outcome.reason,
+    });
+  }
+
+  const totalMs = Date.now() - startedAtMs;
+  const avg = rtts.length ? Math.round(rtts.reduce((a, b) => a + b, 0) / rtts.length) : null;
+
+  return {
+    m,
+    timeout_ms: timeoutPerChallengeMs,
+    total_ms: totalMs,
+    success_count: successCount,
+    rtt_ms_min: rtts.length ? Math.min(...rtts) : null,
+    rtt_ms_avg: avg,
+    rtt_ms_max: rtts.length ? Math.max(...rtts) : null,
+    rtt_ms_p95: rtts.length ? percentile(rtts, 95) : null,
+    rtt_ms_list: rtts,
+    transcript,
+    had_challenge_subscriber: hadSubscriber,
+  };
+}
+
+// ========= Attempt token RX (robust) =========
+let inProgress = false;
+
+let rxBuf = Buffer.alloc(0);
 let tokenExpectedLen = null;
-let tokenChunks = [];
-let tokenReceived = 0;
+let tokenBytesBuf = Buffer.alloc(0);
+
+function resetRx() {
+  rxBuf = Buffer.alloc(0);
+  tokenExpectedLen = null;
+  tokenBytesBuf = Buffer.alloc(0);
+}
 
 class AttemptTokenCharacteristic extends bleno.Characteristic {
   constructor() {
-    super({ uuid: ATTEMPT_TOKEN_UUID, properties: ["write"], value: null });
+    super({
+      uuid: ATTEMPT_TOKEN_UUID,
+      properties: ["write", "writeWithoutResponse"], // ✅ critical
+      value: null,
+    });
   }
-  async onWriteRequest(data, offset, _withoutResponse, cb) {
+
+  onWriteRequest(data, offset, _withoutResponse, cb) {
     if (offset) return cb(this.RESULT_ATTR_NOT_LONG);
+
     try {
-      if (tokenExpectedLen === null) {
-        const s = data.toString("utf8");
-        const m = s.match(/^LEN:(\d+)\n$/);
-        if (!m) {
-          notifyResult({ ok: false, step: "rx", error: "expected LEN:<n>\\n" });
-          return cb(this.RESULT_UNLIKELY_ERROR);
-        }
-        tokenExpectedLen = parseInt(m[1], 10);
-        tokenChunks = [];
-        tokenReceived = 0;
+      if (inProgress) {
+        notifyResult({ ok: false, step: "busy", error: "beacon busy; try again" });
         return cb(this.RESULT_SUCCESS);
       }
 
-      tokenChunks.push(Buffer.from(data));
-      tokenReceived += data.length;
+      rxBuf = Buffer.concat([rxBuf, Buffer.from(data)]);
 
-      if (tokenReceived > tokenExpectedLen) {
-        resetTokenRx();
-        notifyResult({ ok: false, step: "rx", error: "overflow" });
-        return cb(this.RESULT_UNLIKELY_ERROR);
+      if (tokenExpectedLen === null) {
+        const newlineIdx = rxBuf.indexOf("\n");
+        if (newlineIdx === -1) {
+          return cb(this.RESULT_SUCCESS); // wait for more bytes
+        }
+
+        const header = rxBuf.slice(0, newlineIdx + 1).toString("utf8");
+        const m = header.match(/^LEN:(\d+)\n$/);
+        if (!m) {
+          const bad = header.replace(/\n/g, "\\n");
+          resetRx();
+          notifyResult({ ok: false, step: "rx", error: `bad header '${bad}'` });
+          return cb(this.RESULT_UNLIKELY_ERROR);
+        }
+
+        tokenExpectedLen = parseInt(m[1], 10);
+        log("RX header parsed: tokenExpectedLen =", tokenExpectedLen);
+
+        const remainder = rxBuf.slice(newlineIdx + 1);
+        rxBuf = Buffer.alloc(0);
+
+        if (remainder.length > 0) {
+          tokenBytesBuf = Buffer.concat([tokenBytesBuf, remainder]);
+        }
+      } else {
+        tokenBytesBuf = Buffer.concat([tokenBytesBuf, rxBuf]);
+        rxBuf = Buffer.alloc(0);
       }
 
-      if (tokenReceived === tokenExpectedLen) {
-        const token = Buffer.concat(tokenChunks, tokenExpectedLen).toString("utf8");
-        resetTokenRx();
-        runProtocol(token).catch((e) => notifyResult({ ok: false, step: "runProtocol", error: e.message }));
+      if (tokenExpectedLen !== null) {
+        if (tokenBytesBuf.length > tokenExpectedLen) {
+          resetRx();
+          notifyResult({ ok: false, step: "rx", error: "overflow" });
+          return cb(this.RESULT_UNLIKELY_ERROR);
+        }
+
+        if (tokenBytesBuf.length === tokenExpectedLen) {
+          const token = tokenBytesBuf.toString("utf8");
+          log("Token fully received ✅ len=", token.length);
+          resetRx();
+
+          inProgress = true;
+          runBasicProtocol(token)
+            .catch((e) => {
+              err("runBasicProtocol error:", e);
+              notifyResult({ ok: false, step: "runBasicProtocol", error: e.message || String(e) });
+            })
+            .finally(() => {
+              inProgress = false;
+            });
+        }
       }
 
       cb(this.RESULT_SUCCESS);
     } catch (e) {
-      resetTokenRx();
-      notifyResult({ ok: false, step: "rx", error: e.message });
+      err("onWriteRequest error:", e);
+      resetRx();
+      notifyResult({ ok: false, step: "rx", error: e.message || String(e) });
       cb(this.RESULT_UNLIKELY_ERROR);
     }
   }
 }
-function resetTokenRx() {
-  tokenExpectedLen = null;
-  tokenChunks = [];
-  tokenReceived = 0;
-}
 
-// ========= RELAY LOOP + BACKEND ATTEST =========
-function u16le(n) {
-  const b = Buffer.alloc(2);
-  b.writeUInt16LE(n & 0xffff, 0);
-  return b;
-}
-function hrNowNs() {
-  return process.hrtime.bigint(); // monotonic
-}
-function waitForResponse(i, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
-      pending.delete(i);
-      reject(new Error("timeout"));
-    }, timeoutMs);
-    pending.set(i, {
-      resolve: (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      reject: (e) => {
-        clearTimeout(t);
-        reject(e);
-      },
-    });
-  });
-}
+// ========= BASIC BACKEND FLOW =========
+async function runBasicProtocol(attempt_token) {
+  log("runBasicProtocol start");
 
-async function runProtocol(attempt_token) {
-  // config checks
   if (!BACKEND_VERIFY_KEY_HEX || BACKEND_VERIFY_KEY_HEX.length !== 64) {
-    return notifyResult({ ok: false, step: "config", error: "missing BACKEND_VERIFY_KEY_HEX" });
+    return notifyResult({ ok: false, step: "config", error: "missing/invalid BACKEND_VERIFY_KEY_HEX" });
   }
   if (!PI_ID) {
     return notifyResult({ ok: false, step: "config", error: "missing PI_ID" });
   }
-  if (!challengeNotifyCb) {
-    // Not fatal, but useful to know
-    console.warn("No subscriber on CHALLENGE characteristic (phone not listening?)");
-  }
 
-  // 1) Verify attempt_token
+  // 1) verify attempt token signature + claims
   let attemptPayload;
   try {
     attemptPayload = verifyCompactEd25519(attempt_token, BACKEND_VERIFY_KEY_HEX);
@@ -343,29 +526,44 @@ async function runProtocol(attempt_token) {
     return notifyResult({ ok: false, step: "verify_attempt", error: "bad iss/aud" });
   }
   if (attemptPayload.pi_id !== PI_ID) {
-    return notifyResult({ ok: false, step: "verify_attempt", error: "pi_id mismatch" });
+    return notifyResult({
+      ok: false,
+      step: "verify_attempt",
+      error: `pi_id mismatch (token=${attemptPayload.pi_id} env=${PI_ID})`,
+    });
   }
+
   const now = Math.floor(Date.now() / 1000);
   if (attemptPayload.exp_attempt && now >= Number(attemptPayload.exp_attempt)) {
     return notifyResult({ ok: false, step: "verify_attempt", error: "attempt expired" });
   }
-  const attempt_id = attemptPayload.attempt_id;
 
-  // 2) Create session -> sid + tokenB
+  const attempt_id = attemptPayload.attempt_id;
+  log("Attempt verified ✅ attempt_id=", attempt_id);
+
+  // 2) create session
   let sid, tokenB;
   try {
+    log("POST /presence/session", { pi_id: PI_ID, attempt_id });
     const res = await axios.post(
       `${BACKEND_BASE_URL}/presence/session`,
       { pi_id: PI_ID, attempt_id },
-      { timeout: 5000 }
+      { timeout: 8000 }
     );
     sid = res.data.sid;
     tokenB = res.data.tokenB;
+    log("Session created ✅ sid=", sid);
   } catch (e) {
-    return notifyResult({ ok: false, step: "session", error: e.response?.data || e.message });
+    const status = e.response?.status;
+    const body = e.response?.data;
+    err("Session error:", status, body || e.message);
+    if (status === 409) {
+      return notifyResult({ ok: false, step: "session", error: "attempt already consumed (need new attempt token)" });
+    }
+    return notifyResult({ ok: false, step: "session", error: body || e.message });
   }
 
-  // 3) Verify tokenB (defense-in-depth)
+  // 3) verify tokenB
   try {
     const tb = verifyCompactEd25519(tokenB, BACKEND_VERIFY_KEY_HEX);
     if (tb.iss !== "presence-backend" || tb.aud !== "presence-pi") throw new Error("bad iss/aud");
@@ -374,114 +572,84 @@ async function runProtocol(attempt_token) {
     return notifyResult({ ok: false, step: "verify_tokenB", error: e.message });
   }
 
-  // 4) Derive k and send INIT
-  // Use k = sha256(tokenB) where tokenB is the UTF-8 compact token string (same on both ends)
-  const k = sha256Buf(Buffer.from(tokenB, "utf8")); // 32 bytes
-  notifyChallenge(Buffer.concat([Buffer.from([0x00]), k, Buffer.from([RELAY_M & 0xff]), u16le(RELAY_TIMEOUT_MS)]));
-
-  // 5) Relay rounds
-  let success = 0;
-  const rtts = [];
-  const transcriptHasher = crypto.createHash("sha256");
-
-  for (let i = 1; i <= RELAY_M; i++) {
-    const ci = crypto.randomBytes(16);
-    notifyChallenge(Buffer.concat([Buffer.from([0x01, i & 0xff]), ci]));
-
-    const t0 = hrNowNs();
-    let riBuf = null;
-    let dtMs = null;
-
-    try {
-      const resp = await waitForResponse(i & 0xff, RELAY_TIMEOUT_MS);
-      const t1 = hrNowNs();
-      dtMs = Number(t1 - t0) / 1e6;
-      riBuf = resp.r;
-    } catch {
-      dtMs = RELAY_TIMEOUT_MS;
-      riBuf = Buffer.alloc(32, 0);
-    }
-
-    const expected = sha256Buf(k, ci); // sha256(k || ci)
-    const ok = riBuf.equals(expected);
-    if (ok) success += 1;
-    rtts.push(dtMs);
-
-    // transcript hash: i(1) || ci(16) || ri(32) || dt_ms_u32le(4)
-    const dt_u32 = Buffer.alloc(4);
-    dt_u32.writeUInt32LE(Math.max(0, Math.min(0xffffffff, Math.floor(dtMs * 1000))), 0);
-    transcriptHasher.update(Buffer.from([i & 0xff]));
-    transcriptHasher.update(ci);
-    transcriptHasher.update(riBuf);
-    transcriptHasher.update(dt_u32);
-  }
-
-  // 6) Summary + loose policy
-  const sorted = [...rtts].sort((a, b) => a - b);
-  const min = sorted[0] ?? null;
-  const max = sorted[sorted.length - 1] ?? null;
-  const avg = sorted.length ? sorted.reduce((a, b) => a + b, 0) / sorted.length : null;
-  const p95 = sorted.length ? sorted[Math.floor(0.95 * (sorted.length - 1))] : null;
-
-  const timing_summary = deepSort({
-    m: RELAY_M,
-    timeout_ms: RELAY_TIMEOUT_MS,
-    rtt_ms_min: min,
-    rtt_ms_avg: avg,
-    rtt_ms_max: max,
-    rtt_ms_p95: p95,
+  // 3.5) NEW: challenge/response RTT rounds with phone (1..3)
+  // No threshold logic yet; we only log timing + transcript.
+  const timing = await performRelayChallenges({ sid, maxChallenges: 3, timeoutPerChallengeMs: 1200 });
+  log("Challenge summary:", {
+    m: timing.m,
+    success_count: timing.success_count,
+    rtt_ms_min: timing.rtt_ms_min,
+    rtt_ms_avg: timing.rtt_ms_avg,
+    rtt_ms_max: timing.rtt_ms_max,
+    rtt_ms_p95: timing.rtt_ms_p95,
+    had_subscriber: timing.had_challenge_subscriber,
   });
 
-  const transcript_hash = transcriptHasher.digest("hex");
+  // 4) sign attPi immediately
+  // ✅ IMPORTANT: result is BOOLEAN to match your Postgres schema (presence_proofs.result bool)
+  // Also: "log everything in the time summary" -> include transcript.
+  const transcriptJson = JSON.stringify(timing.transcript);
 
-  // loose pass rule: >= 70% correct
-  const pass = success >= Math.ceil(0.7 * RELAY_M);
-  const result = pass ? "ok" : "fail";
-
-  // 7) attPi MUST include tokenB_hash
   const attPayload = deepSort({
     sid,
     tokenB_hash: sha256HexUtf8(tokenB),
-    result,
-    success_count: success,
-    timing_summary,
-    transcript_hash,
-    // optional fields for debugging; backend doesn't require:
+
+    result: true, // <-- forced true for now (threshold later)
+    success_count: timing.success_count,
+
+    timing_summary: {
+      m: timing.m,
+      timeout_ms: timing.timeout_ms,
+      total_ms: timing.total_ms,
+      had_challenge_subscriber: timing.had_challenge_subscriber,
+      rtt_ms_min: timing.rtt_ms_min,
+      rtt_ms_avg: timing.rtt_ms_avg,
+      rtt_ms_max: timing.rtt_ms_max,
+      rtt_ms_p95: timing.rtt_ms_p95,
+      rtt_ms_list: timing.rtt_ms_list,
+      transcript: timing.transcript, // log everything for later analysis
+    },
+
+    transcript_hash: crypto.createHash("sha256").update(transcriptJson, "utf8").digest("hex"),
+
     attempt_id,
     pi_id: PI_ID,
   });
+
   const attPi = signCompactEd25519(attPayload);
 
-  // 8) POST /presence/attest -> proof_id
+  // 5) attest
   try {
     const res = await axios.post(
       `${BACKEND_BASE_URL}/presence/attest`,
       { tokenB, attPi },
-      { timeout: 5000 }
+      { timeout: 8000 }
     );
+    log("Attest OK ✅ proof_id=", res.data.proof_id);
     return notifyResult({ ok: true, proof_id: res.data.proof_id, result: res.data.result });
   } catch (e) {
-    return notifyResult({ ok: false, step: "attest", error: e.response?.data || e.message });
+    const body = e.response?.data;
+    err("Attest error:", body || e.message);
+    return notifyResult({ ok: false, step: "attest", error: body || e.message });
   }
 }
 
 // ========= BLE SERVICE =========
 const characteristics = [
   new IdCharacteristic(),
-  new NonceCharacteristic(),
-  new ResponseCharacteristic(),
+  new AttemptTokenCharacteristic(),
+
+  // NEW: relay-counter challenge RTT layer
+  new ChallengeCharacteristic(),
+  new ChallengeRespCharacteristic(),
+
+  new ResultCharacteristic(),
 ];
 
-// Only enable PoP flow if all UUIDs exist
-if (ATTEMPT_TOKEN_UUID && CHALLENGE_UUID && RESPONSE_UUID && RESULT_UUID) {
-  characteristics.push(new AttemptTokenCharacteristic());
-  characteristics.push(new ChallengeCharacteristic());
-  characteristics.push(new ResponseWriteCharacteristic());
-  characteristics.push(new ResultCharacteristic());
-} else {
-  console.warn(
-    "PoP relay flow disabled: set VITE_ATTEMPT_TOKEN_UUID, VITE_CHALLENGE_UUID, VITE_RESPONSE_UUID, VITE_RESULT_UUID"
-  );
+// include legacy nonce signer only if both UUIDs are provided
+if (LEGACY_NONCE_UUID && LEGACY_RESP_UUID) {
+  characteristics.push(new NonceCharacteristic());
+  characteristics.push(new ResponseCharacteristic());
 }
 
 const service = new bleno.PrimaryService({
@@ -491,22 +659,27 @@ const service = new bleno.PrimaryService({
 
 // ---- BLE lifecycle ----
 bleno.on("stateChange", (state) => {
-  console.log("bleno state:", state);
+  log("bleno state:", state);
   if (state === "poweredOn") {
-    bleno.startAdvertising("BeaconPresence", [SERVICE_UUID], (err) => {
-      if (err) console.error("adv error:", err);
+    bleno.startAdvertising("BeaconPresence", [SERVICE_UUID], (errAdv) => {
+      if (errAdv) err("adv error:", errAdv);
+      else log("advertising...");
     });
   } else {
     bleno.stopAdvertising();
   }
 });
 
-bleno.on("advertisingStart", (err) => {
-  if (err) return console.error("advertisingStart error:", err);
-  console.log("advertising started");
+bleno.on("advertisingStart", (errAdvStart) => {
+  if (errAdvStart) return err("advertisingStart error:", errAdvStart);
+  log("advertising started");
   bleno.setServices([service], (err2) => {
-    if (err2) console.error("setServices error:", err2);
+    if (err2) err("setServices error:", err2);
+    else log("services set ✅");
   });
 });
 
-process.on("SIGINT", () => process.exit(0));
+process.on("SIGINT", () => {
+  log("SIGINT, exiting...");
+  process.exit(0);
+});
