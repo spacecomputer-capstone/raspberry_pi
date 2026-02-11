@@ -37,7 +37,14 @@ node ctrng_seed.js
 
 ### Option 2: Use openssl
 - make sure to edit the BEACON_ID_HEX to the beacon that you are using (eg: 0000000000000002 or 0000000000000003 or 0000000000000002)
-- add a random seed to ED25519_SEED_HEX (can be generated using: 'openssl rand -hex 64`)
+- the output of the follow command is
+```
+...
+<private ED25519_SEED_HEX>
+<public key>
+```
+- add the private key to the .env file
+- add the public key to https://github.com/spacecomputer-capstone/SpaceScrypt/blob/main/api/config/beacons.json along with the BEACON_ID_HEX (the beacon ID)
 
 ```bash
 SEED=$(openssl rand -hex 32); echo "$SEED"
