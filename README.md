@@ -56,6 +56,11 @@ EOF
 ## 5) Add beacon.js
 
 file in the repo
+```bash
+git clone <git_url>
+cd raspberry_pi
+node beacon.js 
+```
 
 
 
